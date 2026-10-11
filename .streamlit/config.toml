@@ -1,0 +1,11 @@
+[browser]
+gatherUsageStats = false
+
+# Neutral widget accent, so selected controls and tags never borrow a chart series colour.
+# Chart line colours are set in app/Home.py (one palette validated on both backgrounds).
+
+[theme.light]
+primaryColor = "#52514e"
+
+[theme.dark]
+primaryColor = "#a3a29b"
