@@ -22,8 +22,9 @@ streamlit run app/Home.py                        # app
 - Evaluate only through `volcast.backtest.walk_forward`. No random splits. Tune hyperparameters inside the training window only.
 - The app reads `results/` only. It must never call Yahoo or fit models.
 - Results from `--source sample` are for development. Don't quote them as findings.
-- If a model beats HAR by a large margin, look for leakage before reporting it.
+- If a model beats HAR by a large margin, look for leakage before reporting it. DESIGN.md §10 records what was checked for LightGBM.
+- Features must be known at the close of day t. VIX closes at 4:15 pm ET, after the 4:00 pm S&P close: use it lagged a day.
 
 ## Status
 
-Phase 1 (walking skeleton) is done. Next: phase 2 — GJR-GARCH-t, LightGBM, Diebold–Mariano, Model Confidence Set, Mincer–Zarnowitz, regimes (DESIGN.md §4, §6).
+Phases 1 and 2 are done: EWMA, HAR-RV, GJR-GARCH-t and LightGBM, scored with Diebold–Mariano, the Model Confidence Set, Mincer–Zarnowitz and regime breakdowns (DESIGN.md §4, §6, §10). Next: phase 3 — Kalman-filter SV and the VIX benchmark (validate their colours against the four in use).

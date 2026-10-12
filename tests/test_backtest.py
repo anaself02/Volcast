@@ -81,7 +81,19 @@ def test_bad_forecasts_are_rejected(raw, small_cfg):
 
 
 def test_run_backtests_covers_every_model_and_horizon(raw, small_cfg):
-    out = run_backtests(build_panel(raw), cfg=small_cfg)
+    out = run_backtests(build_panel(raw), {"ewma": EWMA, "har": HAR}, cfg=small_cfg)
     assert set(map(tuple, out[["model", "horizon"]].drop_duplicates().to_numpy())) == {
         ("ewma", 1), ("ewma", 22), ("har", 1), ("har", 22),
     }
+
+
+def test_the_refit_hook_sees_every_fit_and_changes_nothing(raw, small_cfg):
+    panel = build_panel(raw)
+    seen = []
+    out = walk_forward(panel, HAR, 22, small_cfg, on_refit=lambda date, model: seen.append((date, model.n_train_)))
+    assert [d for d, _ in seen] == list(out["refit_date"].unique())
+    assert all(n > 0 for _, n in seen)
+    pd.testing.assert_frame_equal(out, walk_forward(panel, HAR, 22, small_cfg))
+    calls = []
+    run_backtests(panel, {"ewma": EWMA}, small_cfg, on_refit=lambda h, date, model: calls.append((model.name, h)))
+    assert sorted(set(calls)) == [("ewma", 1), ("ewma", 22)] and len(calls) == 2 * len(seen)

@@ -33,3 +33,11 @@ class VolModel(ABC):
     @abstractmethod
     def forecast(self, panel: pd.DataFrame, horizon: int) -> pd.Series:
         """Forecast for every row of `panel`, indexed like `panel`."""
+
+    def info(self) -> dict:
+        """Diagnostics about the latest fit, recorded per refit in results/refits.parquet.
+
+        A `status` key other than "ok" flags a refit that needed special handling (for example a
+        fallback after a failed optimization); everything else is free-form detail.
+        """
+        return {}

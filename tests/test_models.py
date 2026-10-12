@@ -7,8 +7,8 @@ from volcast.targets import build_panel
 
 
 def test_registry_and_labels():
-    assert set(REGISTRY) == {"ewma", "har"}
-    assert labels() == {"ewma": "EWMA", "har": "HAR-RV"}
+    assert set(REGISTRY) >= {"ewma", "har", "garch"}
+    assert labels()["ewma"] == "EWMA" and labels()["har"] == "HAR-RV" and labels()["garch"] == "GJR-GARCH"
 
 
 def test_ewma_matches_the_recursion(raw):

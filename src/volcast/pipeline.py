@@ -1,4 +1,4 @@
-"""Pipeline CLI: data -> targets -> walk-forward -> evaluation -> results/ (the app's only input).
+"""Pipeline CLI: data -> targets -> walk-forward -> evaluation and tests -> results/ (the app's only input).
 
     python -m volcast.pipeline --source yahoo      # live SPY + VIX
     python -m volcast.pipeline --source sample     # offline sample bundled with arch
@@ -24,6 +24,8 @@ from .config import CRISIS_WINDOWS, RAW_DIR, RESULTS_DIR, BacktestConfig
 from .data import load_raw
 from .evaluate import summarize
 from .models import labels
+from .models.base import VolModel
+from .stats import MCS_BLOCK, MCS_REPS, MCS_SEED, MCS_SIZE, by_regime, calibration, significance
 from .targets import build_panel
 
 log = logging.getLogger("volcast")
@@ -50,13 +52,30 @@ def write_results(
     forecasts: pd.DataFrame,
     metrics: pd.DataFrame,
     meta: dict,
+    tables: dict[str, pd.DataFrame] | None = None,
 ) -> None:
+    """The four phase-1 files, plus one parquet per extra table (dm, mcs, mz, regimes, refits)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     forecasts.to_parquet(out_dir / "forecasts.parquet", index=False)
     metrics.to_parquet(out_dir / "metrics.parquet", index=False)
     cols = ["close", "ret", "v", "vix"]
     panel[cols].reset_index().to_parquet(out_dir / "panel.parquet", index=False)
+    for name, table in (tables or {}).items():
+        table.to_parquet(out_dir / f"{name}.parquet", index=False)
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
+
+
+def refit_record(horizon: int, refit_date: pd.Timestamp, model: VolModel) -> dict:
+    """One row of refits.parquet: the model's own diagnostics for one fit."""
+    info = model.info()
+    return {
+        "model": model.name,
+        "horizon": horizon,
+        "refit_date": refit_date,
+        "status": info.pop("status", "ok"),
+        "n_train": info.pop("n_train", None),
+        "detail": json.dumps(info, default=str),
+    }
 
 
 def run(
@@ -79,8 +98,22 @@ def run(
             diag["ret2_over_v"], *PROXY_RATIO_OK,
         )
 
-    forecasts = run_backtests(panel, cfg=cfg)
+    refits: list[dict] = []
+    forecasts = run_backtests(panel, cfg=cfg, on_refit=lambda h, date, model: refits.append(refit_record(h, date, model)))
     metrics = summarize(forecasts)
+    dm, mcs = significance(forecasts)
+    refit_log = pd.DataFrame(refits)
+    issues = refit_log[refit_log["status"] != "ok"].groupby(["model", "horizon"]).size()
+    for (model, h), n in issues.items():
+        total = int(((refit_log["model"] == model) & (refit_log["horizon"] == h)).sum())
+        log.warning("%s h=%d: %d of %d refits needed special handling (see refits.parquet)", model, h, n, total)
+    tables = {
+        "dm": dm,
+        "mcs": mcs,
+        "mz": calibration(forecasts),
+        "regimes": by_regime(forecasts, panel["vix"], CRISIS_WINDOWS),
+        "refits": refit_log,
+    }
 
     first_origin = forecasts["date"].min()
     meta.update(
@@ -94,12 +127,20 @@ def run(
             "models": labels(),
             "crisis_windows": CRISIS_WINDOWS,
             "proxy": diag,
+            "tests": {
+                "loss": "QLIKE",
+                "dm": {"lags": "h - 1", "correction": "Harvey-Leybourne-Newbold", "benchmarks": ["ewma", "har"]},
+                "mcs": {"size": MCS_SIZE, "reps": MCS_REPS, "block": MCS_BLOCK, "statistic": "R",
+                        "bootstrap": "stationary", "seed": MCS_SEED},
+                "mz": {"lags": "max(h - 1, floor(4 (n / 100)^(2/9)))", "units": "%^2"},
+            },
+            "refit_issues": {f"{model}/{h}": int(n) for (model, h), n in issues.items()},
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "runtime_sec": round(time.perf_counter() - t0, 1),
             "versions": {"volcast": __version__, "pandas": pd.__version__, "numpy": np.__version__},
         }
     )
-    write_results(Path(out_dir), panel, forecasts, metrics, meta)
+    write_results(Path(out_dir), panel, forecasts, metrics, meta, tables)
     log.info("wrote %s (%d forecasts, %.1fs)", out_dir, len(forecasts), meta["runtime_sec"])
     return meta
 
@@ -108,9 +149,15 @@ def _print_metrics(out_dir: Path) -> None:
     m = pd.read_parquet(Path(out_dir) / "metrics.parquet")
     if m.empty:
         return
-    view = m[["horizon", "model", "n", "qlike", "qlike_rel", "mse_pct2", "mse_rel"]].sort_values(["horizon", "qlike"])
-    with pd.option_context("display.float_format", "{:.4f}".format, "display.width", 120):
-        print(view.to_string(index=False))
+    view = m[["horizon", "model", "n", "qlike", "qlike_rel", "mse_pct2", "mse_rel"]]
+    if (Path(out_dir) / "dm.parquet").exists():
+        dm = pd.read_parquet(Path(out_dir) / "dm.parquet")
+        dm = dm.pivot_table(index=["horizon", "model"], columns="benchmark", values="p_value")
+        dm.columns = [f"dm_p_vs_{c}" for c in dm.columns]
+        mcs = pd.read_parquet(Path(out_dir) / "mcs.parquet").set_index(["horizon", "model"])[["mcs_pvalue"]]
+        view = view.join(dm, on=["horizon", "model"]).join(mcs, on=["horizon", "model"])
+    with pd.option_context("display.float_format", "{:.4f}".format, "display.width", 160):
+        print(view.sort_values(["horizon", "qlike"]).to_string(index=False))
 
 
 def main(argv: list[str] | None = None) -> int:

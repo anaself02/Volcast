@@ -15,6 +15,7 @@ dependencies = [
     "scipy>=1.11",
     "arch>=7.0",
     "yfinance>=0.2.54",
+    "lightgbm>=4.0",
 ]
 
 [project.optional-dependencies]

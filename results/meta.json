@@ -23,7 +23,9 @@
   ],
   "models": {
     "ewma": "EWMA",
-    "har": "HAR-RV"
+    "har": "HAR-RV",
+    "garch": "GJR-GARCH",
+    "gbm": "LightGBM"
   },
   "crisis_windows": {
     "2008 crisis": [
@@ -104,8 +106,32 @@
     "overnight_share_of_v": 0.321,
     "ok": true
   },
-  "generated_at": "2026-10-11T22:01:55+00:00",
-  "runtime_sec": 5.0,
+  "tests": {
+    "loss": "QLIKE",
+    "dm": {
+      "lags": "h - 1",
+      "correction": "Harvey-Leybourne-Newbold",
+      "benchmarks": [
+        "ewma",
+        "har"
+      ]
+    },
+    "mcs": {
+      "size": 0.1,
+      "reps": 1000,
+      "block": 22,
+      "statistic": "R",
+      "bootstrap": "stationary",
+      "seed": 20111
+    },
+    "mz": {
+      "lags": "max(h - 1, floor(4 (n / 100)^(2/9)))",
+      "units": "%^2"
+    }
+  },
+  "refit_issues": {},
+  "generated_at": "2026-10-12T01:05:49+00:00",
+  "runtime_sec": 98.2,
   "versions": {
     "volcast": "0.1.0",
     "pandas": "3.0.6",

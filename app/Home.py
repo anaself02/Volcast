@@ -25,18 +25,22 @@ from volcast.targets import to_annual_vol  # noqa: E402
 
 RESULTS_DIR = Path(os.environ.get("VOLCAST_RESULTS_DIR", ROOT / "results"))
 REQUIRED = ["meta.json", "forecasts.parquet", "panel.parquet", "metrics.parquet"]
+OPTIONAL = ["dm", "mcs", "mz", "regimes"]  # phase-2 tables; results written before them still load
 BASELINE = "ewma"
+ALPHA = 0.05  # significance level for the Diebold–Mariano verdicts
 HORIZON_LABELS = {1: "Next day", 22: "Next 22 days"}
 HORIZON_SHORT = {1: "1-day", 22: "22-day"}
 RECENT, FULL, CUSTOM = "Last 2 years", "Full history", "Custom range"
 RECENT_YEARS = 2
 
-# One fixed colour per entity, in the validated categorical order, so filtering never repaints a
-# line. These steps pass the palette checks (CVD separation, lightness, >= 3:1 contrast) on both
-# Streamlit backgrounds (#ffffff and #0e1117), because Streamlit applies its light/dark theme in the
-# browser and the app can't reliably know which one is showing. Future models already have a slot.
-SERIES_ORDER = ["ewma", "har", "garch", "kalman_sv", "gbm", "vix"]
-SERIES_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"]
+# One fixed colour per entity, so filtering never repaints a line. Models take the validated slots in
+# order, except LightGBM: its plum replaces the documented fourth slot (amber), which can't be told
+# apart from HAR-RV's orange where two lines touch. These four pass every palette check with all pairs
+# compared (CVD and normal-vision separation, lightness, >= 3:1 contrast) on both Streamlit backgrounds
+# (#ffffff and #0e1117), because Streamlit applies its theme in the browser. Kalman SV and VIX keep
+# provisional colours, to be validated against these four when they arrive (phase 3).
+SERIES_ORDER = ["ewma", "har", "garch", "gbm", "kalman_sv", "vix"]
+SERIES_COLORS = ["#3987e5", "#d95926", "#199e70", "#a063a5", "#c98500", "#008300"]
 # Realized volatility is what every forecast is judged against, so it is drawn last (on top) in neutral
 # ink: the palette's secondary ink, dark grey on the light theme (7.9:1 on #ffffff) and light grey on the
 # dark one (10.8:1 on #0e1117). If the theme is unknown it falls back to a mid grey that clears 4:1 on both.
@@ -107,13 +111,16 @@ def _stamp(directory: Path) -> float:
 
 
 @st.cache_data(show_spinner="Loading results…")
-def load_results(directory: str, stamp: float) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_results(
+    directory: str, stamp: float
+) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
     d = Path(directory)
     meta = json.loads((d / "meta.json").read_text())
     forecasts = pd.read_parquet(d / "forecasts.parquet")
     panel = pd.read_parquet(d / "panel.parquet").set_index("date")
     metrics = pd.read_parquet(d / "metrics.parquet")
-    return meta, forecasts, panel, metrics
+    extra = {name: pd.read_parquet(d / f"{name}.parquet") for name in OPTIONAL if (d / f"{name}.parquet").exists()}
+    return meta, forecasts, panel, metrics, extra
 
 
 def fmt_vol(x: float) -> str:
@@ -123,6 +130,16 @@ def fmt_vol(x: float) -> str:
 def fmt_date(ts: pd.Timestamp, fmt: str = "%Y-%m-%d") -> str:
     """ISO date with non-breaking hyphens, so a date never splits across lines."""
     return f"{ts:{fmt}}".replace("-", "\u2011")
+
+
+def fmt_p(p: float) -> str:
+    """A p-value for a table cell."""
+    return "—" if p is None or not np.isfinite(p) else ("<0.001" if p < 0.001 else f"{p:.3f}")
+
+
+def p_text(p: float) -> str:
+    """A p-value in a sentence."""
+    return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
 
 
 def horizon_label(h: int) -> str:
@@ -340,7 +357,7 @@ if not all((RESULTS_DIR / f).exists() for f in REQUIRED):
     st.code("python -m volcast.pipeline --source yahoo    # or --source sample, offline", language="bash")
     st.stop()
 
-meta, forecasts, panel, metrics = load_results(str(RESULTS_DIR), _stamp(RESULTS_DIR))
+meta, forecasts, panel, metrics, extra = load_results(str(RESULTS_DIR), _stamp(RESULTS_DIR))
 labels: dict[str, str] = meta["models"]
 horizons: list[int] = sorted(meta["horizons"])
 by_h = sorted(horizons, reverse=True)  # the longer horizon leads: smoother, and what VIX covers
@@ -388,6 +405,30 @@ if not proxy.get("ok", True):
 
 # ----------------------------------------------------------------------------- headline + latest
 
+dm_table, mcs_table = extra.get("dm"), extra.get("mcs")
+
+
+def dm_p(model: str, bench: str, h: int) -> float:
+    """Two-sided Diebold–Mariano p-value of `model` against `bench` over the full sample (NaN if absent)."""
+    if dm_table is None:
+        return float("nan")
+    row = dm_table[(dm_table["model"] == model) & (dm_table["benchmark"] == bench) & (dm_table["horizon"] == h)]
+    return float(row["p_value"].iloc[0]) if len(row) else float("nan")
+
+
+def verdict(model: str, h: int) -> str:
+    """Whether the best model's edge over EWMA, and over HAR-RV, is statistically significant."""
+    if model == BASELINE:
+        return f"No model has a lower QLIKE than {base_label}."
+    parts = []
+    for bench in (BASELINE, "har"):
+        p = dm_p(model, bench, h)
+        if bench != model and bench in labels and np.isfinite(p):
+            word = f"significant at {ALPHA:.0%}" if p < ALPHA else f"not significant at {ALPHA:.0%}"
+            parts.append(f"over {labels[bench]}: {word} ({p_text(p)})")
+    return f"Edge {'; '.join(parts)}." if parts else ""
+
+
 headline, latest_card = st.columns([5, 7], gap="medium")
 
 with headline.container(border=True, height="stretch"):
@@ -406,13 +447,20 @@ with headline.container(border=True, height="stretch"):
             help=f"How much lower the most accurate model's mean QLIKE loss is than the {base_label} "
             f"baseline's, over {int(n_scored.get(h, 0)):,} out-of-sample trading days.",
         )
-    st.caption(
-        ":material/warning: Not yet tested for statistical significance (Diebold–Mariano and Model "
-        "Confidence Set arrive with the next models)."
-    )
+        if win is not None:
+            tile.caption(verdict(win["model"], h))
+    if mcs_table is None:
+        st.caption(":material/warning: These results predate the significance tests: rerun the pipeline.")
+    else:
+        sets = "; ".join(
+            f"{HORIZON_SHORT.get(h, f'{h}-day')} "
+            + ", ".join(labels[m] for m in mcs_table.query("horizon == @h and in_mcs").sort_values("qlike")["model"])
+            for h in by_h
+        )
+        st.caption(f"90% Model Confidence Set, the models the data can't separate from the best: {sets}.")
     st.caption(
         "QLIKE is the standard loss for variance forecasts: 0 is perfect and lower is better. Every model "
-        "is scored on the same days."
+        f"is scored on the same days. Diebold–Mariano tests: two-sided at {ALPHA:.0%}, on QLIKE."
     )
 
 def forecast_vol(model: str, h: int, date: pd.Timestamp | None) -> float:
@@ -626,7 +674,8 @@ else:
         )
 
     with st.expander("Data behind the chart"):
-        data = vol.rename(columns=labels).assign(Realized=vol_realized).round(2)
+        data = vol[[m for m in model_names if m in vol.columns]].rename(columns=labels)
+        data = data.assign(Realized=vol_realized).round(2)
         data = data.rename(columns=lambda c: f"{c} (%)")
         st.dataframe(
             data,
@@ -639,7 +688,153 @@ else:
         )
         st.caption("Annualized volatility in percent. Realized stays empty until the horizon has passed.")
 
+# ----------------------------------------------------------------------------- model comparison
+
+
+def tint_rows(rows: set[int]):
+    return lambda row: [f"background-color: {NEUTRAL_WASH}" if row.name in rows else ""] * len(row)
+
+
+if dm_table is not None and mcs_table is not None and "mz" in extra and "regimes" in extra:
+    st.subheader("Model comparison")
+    first, last = metrics["start"].min(), metrics["end"].max()
+    st.caption(
+        f"Full out-of-sample period, {fmt_date(first)} to {fmt_date(last)}, every model scored on the same "
+        "days. These tables don't follow the controls above."
+    )
+    order = {m: i for i, m in enumerate(model_names)}
+    sig_tab, mz_tab, regime_tab = st.tabs(["Significance", "Calibration", "By regime"])
+
+    with sig_tab:
+        benches = [b for b in (BASELINE, "har") if b in labels]
+        rows = []
+        for _, r in mcs_table.sort_values(["horizon", "qlike"]).iterrows():
+            h, m = int(r["horizon"]), r["model"]
+            row = {"Horizon": HORIZON_SHORT.get(h, f"{h}-day"), "Model": labels[m], "QLIKE": r["qlike"]}
+            for b in benches:
+                d = dm_table[(dm_table["horizon"] == h) & (dm_table["model"] == m) & (dm_table["benchmark"] == b)]
+                row[f"DM vs. {labels[b]}"] = float(d["stat"].iloc[0]) if len(d) else np.nan
+                row[f"p vs. {labels[b]}"] = fmt_p(float(d["p_value"].iloc[0])) if len(d) else "—"
+            row["MCS p"] = r["mcs_pvalue"]
+            row["In 90% MCS"] = "yes" if r["in_mcs"] else "no"
+            rows.append(row)
+        sig = pd.DataFrame(rows)
+        st.dataframe(
+            sig.style.apply(tint_rows(set(np.flatnonzero(sig["In 90% MCS"] == "yes"))), axis=1),
+            hide_index=True,
+            width="stretch",
+            placeholder="—",
+            column_config={
+                "QLIKE": st.column_config.NumberColumn(format="%.3f", help="Mean QLIKE loss. Lower is better."),
+                **{
+                    f"DM vs. {labels[b]}": st.column_config.NumberColumn(
+                        format="%.2f",
+                        help=f"Diebold–Mariano statistic for the QLIKE gap to {labels[b]}. Negative: lower loss than "
+                        f"{labels[b]}.",
+                    )
+                    for b in benches
+                },
+                **{
+                    f"p vs. {labels[b]}": st.column_config.TextColumn(
+                        alignment="right", help=f"Two-sided p-value: below {ALPHA} is significant at {ALPHA:.0%}."
+                    )
+                    for b in benches
+                },
+                "MCS p": st.column_config.NumberColumn(
+                    format="%.3f", help="Model Confidence Set p-value: above 0.10 keeps the model in the 90% set."
+                ),
+                "In 90% MCS": st.column_config.TextColumn(alignment="center"),
+            },
+        )
+        tests = meta.get("tests", {})
+        mcs_cfg = tests.get("mcs", {})
+        st.caption(
+            "Diebold–Mariano: is the mean QLIKE gap between two models zero? Newey–West variance with h − 1 "
+            "lags (22-day forecasts overlap) and the Harvey–Leybourne–Newbold small-sample correction. The "
+            "p-values aren't adjusted for testing several pairs; the Model Confidence Set is. Shaded rows: "
+            f"the 90% Model Confidence Set (Hansen, Lunde and Nason), {mcs_cfg.get('reps', 1000):,} stationary-"
+            f"bootstrap draws with {mcs_cfg.get('block', 22)}-day blocks, seed {mcs_cfg.get('seed', '—')}."
+        )
+
+    with mz_tab:
+        mz = extra["mz"].assign(_o=lambda x: x["model"].map(order)).sort_values(["horizon", "_o"])
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "Horizon": mz["horizon"].map(lambda h: HORIZON_SHORT.get(h, f"{h}-day")),
+                    "Model": mz["model"].map(labels),
+                    "α (%²)": mz["alpha"],
+                    "β": mz["beta"],
+                    "R²": mz["r2"],
+                    "p (α = 0, β = 1)": mz["p_value"].map(fmt_p),
+                    "Days": mz["n"],
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "α (%²)": st.column_config.NumberColumn(format="%.3f", help="Intercept, in variance units (%²)."),
+                "β": st.column_config.NumberColumn(format="%.3f", help="Slope on the forecast. 1 for a well-scaled forecast."),
+                "R²": st.column_config.NumberColumn(format="%.3f"),
+                "p (α = 0, β = 1)": st.column_config.TextColumn(
+                    alignment="right", help="Wald test of α = 0 and β = 1 together, with HAC standard errors."
+                ),
+                "Days": st.column_config.NumberColumn(format="localized"),
+            },
+        )
+        st.caption(
+            "Mincer–Zarnowitz regression of realized on forecast variance: realized = α + β × forecast. A forecast "
+            "that is right on average at every level has α = 0 and β = 1; the p-value tests both at once with "
+            "Newey–West standard errors. β below 1 means the forecasts swing more than the outcomes. In levels "
+            "the fit is dominated by crisis days, so read it with the Bias column and QLIKE."
+        )
+
+    with regime_tab:
+        reg = extra["regimes"]
+
+        def regime_table(kinds: list[str]) -> None:
+            part = reg[reg["kind"].isin(kinds)]
+            keys = part[["horizon", "regime"]].drop_duplicates()
+            rows = []
+            for _, k in keys.iterrows():
+                cell = part[(part["horizon"] == k["horizon"]) & (part["regime"] == k["regime"])].set_index("model")
+                row = {"Horizon": HORIZON_SHORT.get(int(k["horizon"]), f"{k['horizon']}-day"), "Regime": k["regime"],
+                       "Days": int(cell["n"].iloc[0])}
+                row |= {labels[m]: cell.loc[m, "qlike"] for m in model_names if m in cell.index}
+                rows.append(row)
+            table = pd.DataFrame(rows)
+            cols = [labels[m] for m in model_names if labels[m] in table.columns]
+
+            def shade_best(row):
+                best_col = row[cols].astype(float).idxmin()
+                return [f"background-color: {NEUTRAL_WASH}" if c == best_col else "" for c in row.index]
+
+            st.dataframe(
+                table.style.apply(shade_best, axis=1),
+                hide_index=True,
+                width="stretch",
+                placeholder="—",
+                column_config={"Days": st.column_config.NumberColumn(format="localized"),
+                               **{c: st.column_config.NumberColumn(format="%.3f") for c in cols}},
+            )
+
+        regime_table(["stress", "vix"])
+        st.caption(
+            "Mean QLIKE in each regime, lowest shaded. Stress windows are the named periods in the chart. VIX "
+            "terciles split the scored days into thirds by VIX at the forecast date; the cut-offs come from these "
+            "days, and they only group days: no forecast uses them."
+        )
+        with st.expander("Each stress window"):
+            regime_table(["window"])
+
 # ----------------------------------------------------------------------------- method
+
+issues = meta.get("refit_issues", {})
+garch_fallbacks = sum(n for key, n in issues.items() if key.startswith("garch/"))
+garch_note = (
+    f" (it happened {garch_fallbacks} times in this run; see refits.parquet)" if garch_fallbacks
+    else " (it didn't happen in this run)" if "refit_issues" in meta else ""
+)
 
 with st.expander("How this works"):
     st.markdown(
@@ -654,16 +849,25 @@ days on all data up to that date, then forecast daily with frozen parameters unt
 scrambles all data after a cutoff and checks that no earlier forecast changes.
 
 **Models.** EWMA (λ = 0.94) is the naive baseline. HAR-RV regresses future variance on the last day,
-week and month of variance. GARCH, a Kalman-filter stochastic volatility model and LightGBM come next.
+week and month of variance. GJR-GARCH(1,1,1) with Student-t errors is fit on close-to-close returns and
+forecasts the sum of the next h daily variances analytically; a fit that fails or can't forecast falls
+back to the previous refit's parameters{garch_note}. LightGBM learns from features known at each close
+(variance averages over 1, 5, 22 and 66 days, recent negative returns, VIX, its 5-day change, implied
+over realized variance) with a loss that is QLIKE itself, tuned only inside each training window.
 
 **Scores.** QLIKE and MSE are the two losses that still rank forecasts correctly when realized variance
 is itself estimated with noise (Patton 2011). Bias is mean forecast over mean realized variance on the
 same days.
 
+**Tests.** Diebold–Mariano compares two models' QLIKE (Newey–West variance, Harvey–Leybourne–Newbold
+correction). The Model Confidence Set keeps every model the data can't separate from the best.
+Mincer–Zarnowitz regressions check whether forecasts are right on average at every level.
+
 **Proxy check.** Squared returns average {proxy.get('ret2_over_v', float('nan')):.2f}x the variance proxy
 in this data{' (outside the expected 0.8–1.25 range: the index sample records stale opens, so absolute levels run low; model comparisons are still like for like)' if not proxy.get('ok', True) else ', within the expected 0.8–1.25 range'}.
 
-**Not yet.** Significance tests (Diebold–Mariano, Model Confidence Set) arrive with the next models, so
-the gaps in the accuracy table aren't yet tested for statistical significance.
+**Not yet.** The Kalman-filter stochastic volatility model and the VIX benchmark (phase 3), and the
+risk layer (phase 4). The window-by-window accuracy table above isn't significance-tested: only the
+full-period tests in *Model comparison* are.
 """
     )

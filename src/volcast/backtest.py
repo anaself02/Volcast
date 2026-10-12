@@ -18,6 +18,7 @@ from .models.base import VolModel
 from .targets import forward_variance
 
 ModelFactory = Callable[[], VolModel]
+RefitHook = Callable[[pd.Timestamp, VolModel], None]
 
 
 def refit_positions(index: pd.DatetimeIndex, oos_start: str, refit_every: int) -> list[int]:
@@ -31,11 +32,14 @@ def walk_forward(
     model_factory: ModelFactory,
     horizon: int,
     cfg: BacktestConfig = BacktestConfig(),
+    on_refit: RefitHook | None = None,
 ) -> pd.DataFrame:
     """Out-of-sample forecasts for every origin from `cfg.oos_start` to the last row.
 
     Returns one row per origin: date, model, horizon, forecast, realized (NaN until the whole
     horizon has been observed) and the refit date whose parameters produced the forecast.
+    `on_refit(refit_date, model)`, if given, is called after each fit (the pipeline uses it to
+    record `model.info()`); it can't change the forecasts.
     """
     idx = panel.index
     starts = refit_positions(idx, cfg.oos_start, cfg.refit_every)
@@ -53,6 +57,8 @@ def walk_forward(
         model = model_factory()  # fresh instance per refit: no state leaks between blocks
         name = model.name
         model.fit(panel.iloc[: r + 1], horizon)
+        if on_refit is not None:
+            on_refit(idx[r], model)
         f = model.forecast(panel.iloc[: end + 1], horizon)
         if len(f) != end + 1:
             raise ValueError(f"{name}.forecast returned {len(f)} rows for a {end + 1}-row panel")
@@ -79,8 +85,13 @@ def run_backtests(
     panel: pd.DataFrame,
     models: Mapping[str, ModelFactory] | None = None,
     cfg: BacktestConfig = BacktestConfig(),
+    on_refit: Callable[[int, pd.Timestamp, VolModel], None] | None = None,
 ) -> pd.DataFrame:
-    """Walk-forward every model at every horizon; long format."""
+    """Walk-forward every model at every horizon; long format. `on_refit(horizon, date, model)` sees every fit."""
     models = REGISTRY if models is None else models
-    frames = [walk_forward(panel, factory, h, cfg) for factory in models.values() for h in cfg.horizons]
+    frames = []
+    for factory in models.values():
+        for h in cfg.horizons:
+            hook = None if on_refit is None else (lambda date, model, h=h: on_refit(h, date, model))
+            frames.append(walk_forward(panel, factory, h, cfg, on_refit=hook))
     return pd.concat(frames, ignore_index=True)
