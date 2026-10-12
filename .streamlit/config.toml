@@ -1,11 +1,20 @@
 [browser]
 gatherUsageStats = false
 
-# Neutral widget accent, so selected controls and tags never borrow a chart series colour.
-# Chart line colours are set in app/Home.py (one palette validated on both backgrounds).
+[client]
+# No Deploy button or developer menu. With the menu gone, the theme follows the viewer's system setting.
+toolbarMode = "minimal"
+
+# A quiet, neutral interface: colour is reserved for data series and status (app/Home.py). Text is a
+# little smaller than Streamlit's default for a denser page, and the accent is ink, not a hue.
+[theme]
+baseFontSize = 14
+baseRadius = "small"
+headingFontSizes = ["26px", "20px", "17px", "15px", "14px", "13px"]
+headingFontWeights = [700, 600, 600, 600, 600, 600]
 
 [theme.light]
-primaryColor = "#52514e"
+primaryColor = "#31312e"
 
 [theme.dark]
-primaryColor = "#a3a29b"
+primaryColor = "#e4e3dd"

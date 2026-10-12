@@ -6,6 +6,7 @@ $VOLCAST_RESULTS_DIR). It never downloads data or fits models (DESIGN.md §8).
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import sys
@@ -19,12 +20,16 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))  # light imports only: numpy/pandas, no network or model code
 
-from volcast.evaluate import summarize  # noqa: E402
+from volcast.evaluate import common_sample, summarize  # noqa: E402
 from volcast.targets import to_annual_vol  # noqa: E402
 
 RESULTS_DIR = Path(os.environ.get("VOLCAST_RESULTS_DIR", ROOT / "results"))
+REQUIRED = ["meta.json", "forecasts.parquet", "panel.parquet", "metrics.parquet"]
 BASELINE = "ewma"
 HORIZON_LABELS = {1: "Next day", 22: "Next 22 days"}
+HORIZON_SHORT = {1: "1-day", 22: "22-day"}
+RECENT, FULL, CUSTOM = "Last 2 years", "Full history", "Custom range"
+RECENT_YEARS = 2
 
 # One fixed colour per entity, in the validated categorical order, so filtering never repaints a
 # line. These steps pass the palette checks (CVD separation, lightness, >= 3:1 contrast) on both
@@ -32,10 +37,65 @@ HORIZON_LABELS = {1: "Next day", 22: "Next 22 days"}
 # browser and the app can't reliably know which one is showing. Future models already have a slot.
 SERIES_ORDER = ["ewma", "har", "garch", "kalman_sv", "gbm", "vix"]
 SERIES_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"]
-REALIZED_COLOR = "#7d7c76"  # neutral ink: 4.2:1 on white, 4.5:1 on the dark background
+# Realized volatility is what every forecast is judged against, so it is drawn last (on top) in neutral
+# ink: the palette's secondary ink, dark grey on the light theme (7.9:1 on #ffffff) and light grey on the
+# dark one (10.8:1 on #0e1117). If the theme is unknown it falls back to a mid grey that clears 4:1 on both.
+REALIZED_INK = {"light": "#52514e", "dark": "#c3c2b7"}
+REALIZED_FALLBACK = "#7d7c76"
 SPIKE_COLOR = "#898781"
+# Neutral wash behind named stress periods and behind the best model's rows in the accuracy table:
+# about 1.2:1 against either background, so the theme's ink stays above 10:1 on top of it.
+NEUTRAL_WASH = "rgba(137, 135, 129, 0.16)"
+# Short labels for the stress periods in config.CRISIS_WINDOWS, for views too narrow for the full names.
+SHORT_NAMES = {
+    "2008 crisis": "GFC",
+    "2010 flash crash": "Flash crash",
+    "2011 downgrade": "Downgrade",
+    "2015 China devaluation": "China",
+    "Feb 2018 vol spike": "Vol spike",
+    "Q4 2018 selloff": "Q4 2018",
+    "COVID 2020": "COVID",
+    "2022 rate hikes": "Rate hikes",
+    "April 2025 tariff shock": "Tariffs",
+}
 
-st.set_page_config(page_title="Volcast", layout="wide")
+# Chart geometry. The figure has a fixed height, so vertical label spacing can be computed exactly;
+# the width is only known in the browser, so horizontal spacing assumes a phone-sized plot.
+CHART_HEIGHT = 420
+PLOT_HEIGHT_PX = 340  # CHART_HEIGHT minus the legend band and the x-axis labels (measured: 355)
+NARROW_PLOT_PX = 270  # plot width on a 375px phone (measured: 283 on a 390px one)
+LABEL_ROW_PX, MAX_LABEL_ROWS, LABEL_GAP_PX = 13, 3, 6
+LINE_LABEL_GAP_PX = 14
+# Advance widths of the chart font (Source Sans) in thousandths of an em, measured in the browser, so
+# label widths can be computed to within a pixel. Characters not listed count as wide.
+GLYPH_EM = {
+    **dict.fromkeys("0123456789+", 497), **dict.fromkeys(".,:;'", 249), " ": 200, "-": 311, "–": 480,
+    "(": 303, ")": 303, "/": 350, "&": 609, "%": 824,
+    "a": 504, "b": 553, "c": 456, "d": 555, "e": 496, "f": 292, "g": 504, "h": 544, "i": 247, "j": 247,
+    "k": 495, "l": 255, "m": 829, "n": 547, "o": 542, "p": 555, "q": 555, "r": 347, "s": 419, "t": 338,
+    "u": 544, "v": 467, "w": 719, "x": 446, "y": 467, "z": 425,
+    "A": 543, "B": 588, "C": 571, "D": 615, "E": 527, "F": 494, "G": 617, "H": 652, "I": 263, "J": 479,
+    "K": 579, "L": 486, "M": 727, "N": 647, "O": 664, "P": 566, "Q": 664, "R": 569, "S": 534, "T": 536,
+    "U": 645, "V": 515, "W": 786, "X": 513, "Y": 476, "Z": 539,
+}
+
+# The app's only custom CSS. It hooks onto data-testid attributes and the app's own vc-* classes, not
+# Streamlit's generated class names, so a Streamlit upgrade can at worst undo it, not break the page.
+CSS = """
+<style>
+.stApp { font-variant-numeric: tabular-nums; }
+[data-testid="stHeader"] { display: none; }
+[data-testid="stMainBlockContainer"] { padding-top: 0.75rem; }
+.vc-strip { display: flex; flex-wrap: wrap; gap: 0.1rem 1.5rem; padding: 0.15rem 0 0.4rem;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.3); font-size: 0.75rem; line-height: 1.5;
+  font-family: "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.vc-strip span { white-space: nowrap; }
+.vc-strip span.vc-wrap { white-space: normal; }
+.vc-strip b { font-weight: 400; opacity: 0.6; letter-spacing: 0.04em; margin-right: 0.45em; text-transform: uppercase; }
+</style>
+"""
+
+st.set_page_config(page_title="Volcast · S&P 500 volatility forecasts", page_icon=":material/insights:", layout="wide")
 
 
 # ----------------------------------------------------------------------------- data
@@ -46,203 +106,542 @@ def _stamp(directory: Path) -> float:
     return max((f.stat().st_mtime for f in files), default=0.0)
 
 
-@st.cache_data(show_spinner=False)
-def load_results(directory: str, stamp: float) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+@st.cache_data(show_spinner="Loading results…")
+def load_results(directory: str, stamp: float) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     d = Path(directory)
     meta = json.loads((d / "meta.json").read_text())
     forecasts = pd.read_parquet(d / "forecasts.parquet")
     panel = pd.read_parquet(d / "panel.parquet").set_index("date")
-    return meta, forecasts, panel
+    metrics = pd.read_parquet(d / "metrics.parquet")
+    return meta, forecasts, panel, metrics
 
 
 def fmt_vol(x: float) -> str:
     return "n/a" if x is None or not np.isfinite(x) else f"{x:.1f}%"
 
 
+def fmt_date(ts: pd.Timestamp, fmt: str = "%Y-%m-%d") -> str:
+    """ISO date with non-breaking hyphens, so a date never splits across lines."""
+    return f"{ts:{fmt}}".replace("-", "\u2011")
+
+
+def horizon_label(h: int) -> str:
+    return HORIZON_LABELS.get(h, f"Next {h} days")
+
+
 def series_color(name: str) -> str:
     return SERIES_COLORS[SERIES_ORDER.index(name)] if name in SERIES_ORDER else SERIES_COLORS[-1]
 
 
+def vs_baseline(rel: float) -> str:
+    """A loss ratio to the baseline in words: 0.819 -> '18.1% lower'."""
+    if rel is None or not np.isfinite(rel):
+        return "—"
+    pct = (1.0 - rel) * 100
+    return "same" if abs(pct) < 0.05 else f"{abs(pct):.1f}% {'lower' if pct > 0 else 'higher'}"
+
+
+def best_per_horizon(scored: pd.DataFrame) -> dict[int, pd.Series]:
+    """Lowest mean QLIKE per horizon."""
+    return {int(h): g.loc[g["qlike"].idxmin()] for h, g in scored.groupby("horizon")}
+
+
+def bias(forecasts: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Mean forecast over mean realized variance per model and horizon, on summarize()'s common sample."""
+    fc = forecasts[(forecasts["date"] >= start) & (forecasts["date"] <= end)]
+    rows = []
+    for h in sorted(fc["horizon"].unique()):
+        wide = common_sample(fc, int(h))
+        y = wide.pop("realized")
+        rows += [{"model": m, "horizon": int(h), "bias": wide[m].mean() / y.mean()} for m in wide.columns]
+    return pd.DataFrame(rows, columns=["model", "horizon", "bias"])
+
+
+def text_px(text: str, size: float) -> float:
+    """Rendered width of `text` in the chart font at `size` px."""
+    return size * sum(GLYPH_EM.get(c, 830) for c in text) / 1000
+
+
+def status_strip(items: list[tuple[str, str]], wrap: tuple[str, ...] = ()) -> str:
+    """One terminal-style line of key-value pairs; only the items named in `wrap` may break across lines."""
+    cells = []
+    for k, v in items:
+        cls = ' class="vc-wrap"' if k in wrap else ""
+        cells.append(f"<span{cls}><b>{html.escape(k)}</b>{html.escape(v)}</span>")
+    return f'<div class="vc-strip">{"".join(cells)}</div>'
+
+
+# ----------------------------------------------------------------------------- chart
+
+
+def _band_labels(
+    bands: list[tuple[str, pd.Timestamp, pd.Timestamp]], start: pd.Timestamp, span: float
+) -> dict[str, tuple[int, float, str]]:
+    """Row, centre (0-1) and text for each stress-period label that fits on a phone-width plot.
+
+    Full names when every one fits, short names otherwise. Labels go left to right into the first of up
+    to three rows where they don't touch a neighbour; a label that fits in none is left to the tooltip.
+    """
+
+    def place(text_of) -> dict[str, tuple[int, float, str]]:
+        ends, placed = [-1.0] * MAX_LABEL_ROWS, {}
+        for name, a, b in sorted(bands, key=lambda w: w[1]):
+            text = text_of(name)
+            half = text_px(text, 11) / NARROW_PLOT_PX / 2
+            mid = ((a - start).total_seconds() + (b - start).total_seconds()) / 2 / span
+            mid = min(max(mid, half), 1 - half)  # keep the label inside the plot
+            for row in range(MAX_LABEL_ROWS):
+                if mid - half >= ends[row] + LABEL_GAP_PX / NARROW_PLOT_PX:
+                    ends[row], placed[name] = mid + half, (row, mid, text)
+                    break
+        return placed
+
+    full = place(lambda name: name)
+    return full if len(full) == len(bands) else place(lambda name: SHORT_NAMES.get(name, name))
+
+
+def race_figure(
+    lines: list[tuple[str, pd.Series, str]],
+    windows: dict[str, tuple[pd.Timestamp, pd.Timestamp]],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    label_order: list[str],
+    styles: dict[str, dict],
+    log: bool = False,
+) -> go.Figure:
+    """Forecast vs realized lines, shaded stress periods, and direct labels where they fit.
+
+    `lines` are (name, annualized vol, colour) in drawing order, so the last one is on top;
+    `label_order` ranks the names for the direct labels, so the most important line keeps its label
+    when two would collide. `styles` sets each line's width in px and, optionally, its opacity.
+    """
+    values = pd.concat([s for _, s, _ in lines]).dropna()
+    values = values[values > 0]
+    peak, low = (float(values.max()), float(values.min())) if len(values) else (5.0, 1.0)
+    span = (end - start).total_seconds()
+    dates = pd.DatetimeIndex(sorted(set().union(*(s.index for _, s, _ in lines))))
+
+    def frac(t: pd.Timestamp) -> float:  # position along the x-axis, 0 to 1
+        return (t - start).total_seconds() / span
+
+    # Stress periods in view. One that fills most of the view is the view itself, so it isn't shaded.
+    bands = []
+    for name, (a, b) in windows.items():
+        a, b = max(a, start), min(b, end)
+        if a < b and (b - a).total_seconds() < 0.8 * span:
+            bands.append((name, a, b))
+    labels = _band_labels(bands, start, span)
+
+    # Leave room above the data for the label rows, so labels never sit on a line.
+    rows = 1 + max((row for row, _, _ in labels.values()), default=-1)
+    room = (rows * LABEL_ROW_PX + 8) / PLOT_HEIGHT_PX if rows else 0.05
+    if log:
+        y0, y_peak = np.log10(low * 0.9), np.log10(peak)
+        y_range = [y0, y_peak + (y_peak - y0) * room / (1 - room)]
+    else:
+        y_range = [0.0, max(peak / (1 - room), 5.0)]
+
+    def to_px(v: float) -> float:  # height above the x-axis, in px
+        y = np.log10(v) if log else v
+        return (y - y_range[0]) / (y_range[1] - y_range[0]) * PLOT_HEIGHT_PX
+
+    fig = go.Figure()
+    if bands:
+        # An invisible trace that names the stress period in the tooltip, so every band can be
+        # identified on hover, including any whose label didn't fit. It has a point on every date
+        # (hover info off outside the bands): with gaps, the tooltip would borrow the nearest band's
+        # name for dates just outside it.
+        period = np.full(len(dates), "", dtype=object)
+        for name, a, b in bands:
+            period[(dates >= a) & (dates <= b)] = f"<i>{name}</i>"
+        fig.add_trace(
+            go.Scatter(
+                x=dates.to_numpy(), y=np.full(len(dates), low), text=period, name="Stress period", mode="lines",
+                line={"width": 0}, showlegend=False, hoverinfo=np.where(period == "", "none", "text"),
+            )
+        )
+    for rank, (name, s, color) in enumerate(lines):
+        fig.add_trace(
+            go.Scatter(
+                x=s.index.to_numpy(), y=s.to_numpy(), name=name, mode="lines",
+                legendrank=1 if rank == len(lines) - 1 else 2 + rank,  # realized first, then the fixed model order
+                line={"color": color, "width": styles[name]["width"]}, opacity=styles[name].get("opacity", 1.0),
+                hovertemplate="<b>%{y:.1f}%</b>",
+            )
+        )
+    # Shapes and annotations are collected and set once: adding them one by one copies the layout each time.
+    shapes = [
+        {"type": "rect", "xref": "x", "yref": "paper", "x0": a, "x1": b, "y0": 0, "y1": 1,
+         "fillcolor": NEUTRAL_WASH, "line": {"width": 0}, "layer": "below"}
+        for _, a, b in bands
+    ]
+    notes = [
+        {"x": start + pd.Timedelta(seconds=mid * span), "y": 1, "xref": "x", "yref": "paper", "yanchor": "top",
+         "yshift": -3 - row * LABEL_ROW_PX, "text": text, "showarrow": False, "font": {"size": 11}}
+        for row, mid, text in labels.values()
+    ]
+
+    # Direct labels at the right edge, where the lines end. Labels that would collide aren't nudged
+    # apart (that detaches them from their line); the legend and tooltip carry those instead.
+    placed: dict[str, float] = {}
+    by_name = {name: s for name, s, _ in lines}
+    for name in label_order:
+        s = by_name.get(name, pd.Series(dtype=float)).dropna()
+        if s.empty or frac(s.index[-1]) < 0.96:  # realized stops h days early; skip if it ends far left
+            continue
+        y_px = to_px(s.iloc[-1])
+        if all(abs(y_px - p) >= LINE_LABEL_GAP_PX for p in placed.values()):
+            placed[name] = y_px
+            notes.append(
+                {"x": 1, "xref": "paper", "xanchor": "left", "xshift": 6, "y": np.log10(s.iloc[-1]) if log else s.iloc[-1],
+                 "yref": "y", "text": name, "showarrow": False, "font": {"size": 12}}
+            )
+    right = 10 + max(text_px(name, 12) for name in placed) if placed else 8
+
+    yaxis = {"type": "log" if log else "linear", "range": y_range, "fixedrange": True, "automargin": True,
+             "ticksuffix": "%", "zeroline": False}
+    if log:  # round ticks: 5%, 10%, 20%, 50%, ...
+        top = 10 ** y_range[1]
+        ticks = [v for v in (1, 2, 5, 10, 20, 50, 100, 200, 500) if low * 0.9 <= v <= top]
+        yaxis |= {"tickvals": ticks, "ticktext": [f"{v}%" for v in ticks]}
+    fig.update_layout(
+        shapes=shapes,
+        annotations=notes,
+        height=CHART_HEIGHT,
+        margin={"l": 0, "r": right, "t": 36, "b": 0},
+        hovermode="x unified",
+        hoverlabel={"font_size": 13},
+        dragmode=False,
+        legend={
+            "orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0, "title": None,
+            "itemclick": False, "itemdoubleclick": False,
+        },
+        xaxis={
+            "range": [start, end], "fixedrange": True, "automargin": True, "showgrid": False,
+            "ticks": "outside", "hoverformat": "%a %Y-%m-%d",
+            "showspikes": True, "spikemode": "across", "spikesnap": "cursor",
+            "spikethickness": 1, "spikecolor": SPIKE_COLOR, "spikedash": "solid",
+        },
+        yaxis=yaxis,
+    )
+    return fig
+
+
 # ----------------------------------------------------------------------------- page
 
-required = ["meta.json", "forecasts.parquet", "panel.parquet"]
-if not all((RESULTS_DIR / f).exists() for f in required):
+st.html(CSS)
+
+if not all((RESULTS_DIR / f).exists() for f in REQUIRED):
     st.title("Volcast")
     st.error(
-        f"No results found in `{RESULTS_DIR}`. Run `python -m volcast.pipeline --source yahoo` "
-        "(or `--source sample` offline) first."
+        f"No results found in `{RESULTS_DIR}`. The app only reads pipeline output; it never downloads "
+        "data or fits models. Run the pipeline first:",
     )
+    st.code("python -m volcast.pipeline --source yahoo    # or --source sample, offline", language="bash")
     st.stop()
 
-meta, forecasts, panel = load_results(str(RESULTS_DIR), _stamp(RESULTS_DIR))
+meta, forecasts, panel, metrics = load_results(str(RESULTS_DIR), _stamp(RESULTS_DIR))
 labels: dict[str, str] = meta["models"]
-horizons: list[int] = meta["horizons"]
+horizons: list[int] = sorted(meta["horizons"])
+by_h = sorted(horizons, reverse=True)  # the longer horizon leads: smoother, and what VIX covers
 model_names = [m for m in SERIES_ORDER if m in labels] + [m for m in labels if m not in SERIES_ORDER]
+base_label = labels.get(BASELINE, BASELINE.upper())
+oos_start, data_end = pd.Timestamp(meta["oos_start"]), pd.Timestamp(meta["data_end"])
+origins = np.sort(forecasts["date"].unique())
+last_date = pd.Timestamp(origins[-1])
+prev_date = pd.Timestamp(origins[-2]) if len(origins) > 1 else None
+best = best_per_horizon(metrics)
+n_scored = metrics.groupby("horizon")["n"].max()  # every model is scored on the same days
 
+# ----------------------------------------------------------------------------- header
+
+st.html(
+    status_strip(
+        [
+            ("Source", meta.get("source_label", meta["source"])),
+            ("Data through", f"{data_end:%Y-%m-%d}"),
+            ("Last refit", f"{forecasts['refit_date'].max():%Y-%m-%d}"),
+            ("Out of sample", f"{oos_start:%Y-%m-%d} → {data_end:%Y-%m-%d}"),
+            ("Scored", " · ".join(f"{HORIZON_SHORT.get(h, f'{h}-day')} {int(n):,} days" for h, n in n_scored.items())),
+        ],
+        wrap=("Source",),
+    )
+)
 st.title("Volcast")
-st.markdown("S&P 500 volatility forecasts, tested out of sample.")
-st.caption(
-    f"Data through {meta['data_end']} · out-of-sample from {meta['oos_start']} · "
-    f"parameters refit every {meta['refit_every']} trading days · generated {meta['generated_at'][:16].replace('T', ' ')} UTC"
+st.markdown(
+    "Volatility forecasts for the S&P 500, scored out of sample. Each model forecasts annualized volatility "
+    "for the next trading day and the next 22, using only data available at each close, and is compared "
+    "with the volatility that followed."
 )
 if meta["source"] == "sample":
     st.info(
         "Showing the offline sample (S&P 500 index 1999–2018 bundled with the `arch` package), "
-        "used for development. Live SPY results come from `python -m volcast.pipeline --source yahoo`."
+        "used for development. Live SPY results come from `python -m volcast.pipeline --source yahoo`.",
+    )
+proxy = meta.get("proxy", {})
+if not proxy.get("ok", True):
+    st.warning(
+        f"Variance proxy check: squared returns average {proxy.get('ret2_over_v', float('nan')):.2f}x the "
+        "variance proxy in this data, outside the expected 0.8–1.25 range, so absolute volatility levels "
+        "run low. Model comparisons are still like for like. Details under *How this works*.",
     )
 
-# ----------------------------------------------------------------------------- latest forecast
+# ----------------------------------------------------------------------------- headline + latest
 
-last_date = forecasts["date"].max()
-latest = forecasts[forecasts["date"] == last_date]
-st.subheader("Latest forecast")
-st.caption(f"Made at the close on {last_date:%A %d %B %Y}, annualized.")
+headline, latest_card = st.columns([5, 7], gap="medium")
 
-n_cols = len(model_names) + 2  # same grid on every row: models, realized, VIX
-for h in horizons:
-    row = latest[latest["horizon"] == h].set_index("model")["forecast"]
-    st.markdown(f"**{HORIZON_LABELS.get(h, f'Next {h} days')}**")
-    cols = st.columns(n_cols)
-    for col, m in zip(cols, model_names):
-        col.metric(labels[m], fmt_vol(to_annual_vol(row[m], h)) if m in row.index else "n/a", border=True)
-    recent = panel["v"].iloc[-h:].sum()
-    cols[len(model_names)].metric(
-        "Realized, last day" if h == 1 else f"Realized, last {h} days", fmt_vol(to_annual_vol(recent, h)), border=True,
-        help="What volatility has actually been over the most recent period, for context.",
-    )
-    if h == max(horizons):
-        cols[-1].metric(
-            "VIX", fmt_vol(panel["vix"].iloc[-1]), border=True,
-            help="The market's own 30-day volatility forecast, implied by S&P 500 option prices.",
+with headline.container(border=True, height="stretch"):
+    first, last = metrics["start"].min(), metrics["end"].max()
+    kind = "Development sample, not a finding" if meta["source"] == "sample" else "Out-of-sample accuracy"
+    st.caption(f"{kind} · QLIKE loss vs. the {base_label} baseline · {fmt_date(first, '%Y-%m')} to {fmt_date(last, '%Y-%m')}")
+    for tile, h in zip(st.columns(len(horizons), gap="small"), by_h):
+        win = best.get(h)
+        if win is not None and win["model"] != BASELINE and np.isfinite(win["qlike_rel"]):
+            label, value = f"{horizon_label(h)} · {labels[win['model']]}", f"{(1 - win['qlike_rel']) * 100:.1f}%"
+            delta = f"lower QLIKE than {base_label}"
+        else:
+            label, value, delta = horizon_label(h), "—", f"no model beats {base_label}"
+        tile.metric(
+            label, value, delta, delta_color="off", delta_arrow="off",
+            help=f"How much lower the most accurate model's mean QLIKE loss is than the {base_label} "
+            f"baseline's, over {int(n_scored.get(h, 0)):,} out-of-sample trading days.",
         )
+    st.caption(
+        ":material/warning: Not yet tested for statistical significance (Diebold–Mariano and Model "
+        "Confidence Set arrive with the next models)."
+    )
+    st.caption(
+        "QLIKE is the standard loss for variance forecasts: 0 is perfect and lower is better. Every model "
+        "is scored on the same days."
+    )
 
-st.divider()
+def forecast_vol(model: str, h: int, date: pd.Timestamp | None) -> float:
+    f = forecasts[(forecasts["date"] == date) & (forecasts["horizon"] == h) & (forecasts["model"] == model)]
+    return to_annual_vol(f["forecast"].iloc[0], h) if len(f) else float("nan")
+
+
+def gap_to_realized(now: float, recent: float, h: int) -> str:
+    period = "on the last day" if h == 1 else f"over the last {h} days"
+    if not (np.isfinite(now) and np.isfinite(recent)):
+        return ""
+    if abs(now - recent) < 0.05:
+        return f"In line with realized vol {period} ({recent:.1f}%)"
+    return f"{abs(now - recent):.1f} pts {'above' if now > recent else 'below'} realized vol {period} ({recent:.1f}%)"
+
+
+with latest_card.container(border=True, height="stretch"):
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.caption(
+            f"Latest forecast · made at the close of {fmt_date(last_date)} · annualized volatility", width="stretch"
+        )
+        with st.popover("All models", width="content"):
+            st.table(
+                pd.DataFrame(
+                    {f"{horizon_label(h)} (%)": [forecast_vol(m, h, last_date) for m in model_names] for h in by_h},
+                    index=pd.Index([labels[m] for m in model_names], name="Model"),
+                ).style.format("{:.1f}", na_rep="—")
+            )
+    tiles = st.columns(len(horizons) + 1, gap="small")
+    for tile, h in zip(tiles, by_h):
+        m = best[h]["model"] if h in best else model_names[0]
+        now, before = forecast_vol(m, h, last_date), forecast_vol(m, h, prev_date)
+        with tile:
+            st.metric(
+                f"{horizon_label(h)} · {labels[m]}", fmt_vol(now),
+                f"{now - before:+.1f} pts" if np.isfinite(now - before) else None,
+                delta_color="off", delta_description="vs. prior day",
+                help=f"Annualized volatility forecast for the {horizon_label(h).lower()} from {labels[m]}, the "
+                "most accurate model at this horizon out of sample. Annualized volatility is the standard "
+                "deviation of returns scaled to one year, in percent.",
+            )
+            st.caption(gap_to_realized(now, to_annual_vol(panel["v"].iloc[-h:].sum(), h), h))
+    vix = panel["vix"].dropna()
+    with tiles[-1]:
+        st.metric(
+            "VIX", fmt_vol(vix.iloc[-1]) if len(vix) else "n/a",
+            f"{vix.iloc[-1] - vix.iloc[-2]:+.1f} pts" if len(vix) > 1 else None,
+            delta_color="off", delta_description="vs. prior day",
+            help="Cboe's VIX index: the market's 30-day volatility forecast, implied by S&P 500 option prices.",
+        )
+        st.caption("Market-implied, next 30 calendar days")
 
 # ----------------------------------------------------------------------------- model race
 
 st.subheader("Forecast vs. realized")
+st.caption(
+    "Forecast: a model's annualized volatility for the period after each close, dated at that close. "
+    "Realized: the volatility that followed (grey, drawn on top). Shaded: named stress periods."
+)
 
-oos_start, data_end = pd.Timestamp(meta["oos_start"]), pd.Timestamp(meta["data_end"])
 windows = {
     name: (pd.Timestamp(a), pd.Timestamp(b))
     for name, (a, b) in meta.get("crisis_windows", {}).items()
     if pd.Timestamp(b) >= oos_start and pd.Timestamp(a) <= data_end
 }
-FULL, CUSTOM = "Full out-of-sample period", "Custom range"
+recent_start = max(oos_start, data_end - pd.DateOffset(years=RECENT_YEARS))
+st.session_state.setdefault("scale", "Linear")
 
-f1, f2, f3 = st.columns([1.2, 2, 2])
+
+def default_scale() -> None:
+    """Log on the full history, so calm years aren't squashed by 2008 and 2020; linear elsewhere."""
+    st.session_state["scale"] = "Log" if st.session_state["period"] == FULL else "Linear"
+
+
+f1, f2, f3, f4 = st.columns([1.1, 1.4, 1.7, 0.9], gap="small")
 with f1:
     horizon = st.segmented_control(
-        "Horizon", horizons, default=horizons[-1], format_func=lambda h: HORIZON_LABELS.get(h, f"{h} days"),
-        required=True, key="horizon",
+        "Horizon", horizons, default=by_h[0], format_func=horizon_label, required=True, key="horizon",
+        help="Total volatility over the next trading day, or over the next 22 trading days (about a month).",
     )
 with f2:
-    chosen = st.multiselect("Models", model_names, default=model_names, format_func=lambda m: labels[m], key="models")
+    picked_models = st.pills(
+        "Models", model_names, selection_mode="multi", default=model_names, format_func=lambda m: labels[m],
+        key="models",
+        help="EWMA: exponentially weighted average of past daily variance (RiskMetrics, λ = 0.94), the "
+        "baseline. HAR-RV: regression of future variance on the last day, week and month of variance.",
+    )
+    chosen = [m for m in model_names if m in picked_models]  # fixed order: colours follow the model
 with f3:
-    period = st.selectbox("Period", [FULL, *windows, CUSTOM], key="period")
-
-if period == FULL:
-    start, end = oos_start, data_end
-elif period == CUSTOM:
-    picked = st.date_input(
-        "Dates", value=(oos_start.date(), data_end.date()),
-        min_value=oos_start.date(), max_value=data_end.date(), key="dates",
-    )
-    if not isinstance(picked, tuple) or len(picked) != 2:
-        st.caption("Pick a start and an end date.")
-        st.stop()
-    start, end = pd.Timestamp(picked[0]), pd.Timestamp(picked[1])
-else:
-    start, end = windows[period]
-
-if not chosen:
-    st.caption("Select at least one model.")
-    st.stop()
-
-fc = forecasts[(forecasts["horizon"] == horizon) & forecasts["date"].between(start, end)]
-wide = fc.pivot(index="date", columns="model", values="forecast")
-realized = fc.groupby("date")["realized"].first()
-vol = wide.apply(lambda s: to_annual_vol(s, horizon))
-vol_realized = to_annual_vol(realized, horizon)
-
-fig = go.Figure()
-fig.add_trace(
-    go.Scatter(
-        x=vol_realized.index, y=vol_realized.to_numpy(), name="Realized", mode="lines",
-        line={"color": REALIZED_COLOR, "width": 2}, hovertemplate="<b>%{y:.1f}%</b>",
-    )
-)
-for m in chosen:
-    if m in vol.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=vol.index, y=vol[m].to_numpy(), name=labels[m], mode="lines",
-                line={"color": series_color(m), "width": 2}, hovertemplate="<b>%{y:.1f}%</b>",
-            )
+    period = st.selectbox("Period", [RECENT, FULL, *windows, CUSTOM], key="period", on_change=default_scale)
+    problem = None
+    if period == RECENT:
+        start, end = recent_start, data_end
+    elif period == FULL:
+        start, end = oos_start, data_end
+    elif period == CUSTOM:
+        picked = st.date_input(
+            "Dates", value=(recent_start.date(), data_end.date()),
+            min_value=oos_start.date(), max_value=data_end.date(), key="dates",
         )
-fig.update_layout(
-    height=440,
-    margin={"l": 0, "r": 0, "t": 40, "b": 0},
-    hovermode="x unified",
-    legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0, "title": None},
-    xaxis={
-        "automargin": True, "showgrid": False, "ticks": "outside", "hoverformat": "%a %d %b %Y",
-        "showspikes": True, "spikemode": "across", "spikesnap": "cursor",
-        "spikethickness": 1, "spikecolor": SPIKE_COLOR, "spikedash": "solid",
-    },
-    yaxis={
-        "automargin": True, "title": {"text": "Annualized volatility"}, "ticksuffix": "%",
-        "rangemode": "tozero", "zeroline": False,
-    },
-)
-st.plotly_chart(fig, width="stretch", theme="streamlit", config={"displaylogo": False})
-st.caption(
-    "Each point is dated on the day the forecast was made. The realized line shows what actually "
-    f"happened over the {'following day' if horizon == 1 else f'following {horizon} trading days'}."
-)
-
-# ----------------------------------------------------------------------------- accuracy
-
-scored = summarize(forecasts[forecasts["model"].isin(chosen)], baseline=BASELINE, start=start, end=end)
-scored = scored[scored["horizon"] == horizon].sort_values("qlike")
-if scored.empty:
-    st.caption("No scored forecasts in this window yet (realized volatility isn't known until the horizon has passed).")
-else:
-    table = pd.DataFrame(
-        {
-            "Model": scored["model"].map(labels),
-            "Days scored": scored["n"],
-            "QLIKE": scored["qlike"],
-            "QLIKE vs EWMA": (scored["qlike_rel"] - 1) * 100,
-            "MSE (%²)": scored["mse_pct2"],
-            "MSE vs EWMA": (scored["mse_rel"] - 1) * 100,
-        }
+        if isinstance(picked, tuple) and len(picked) == 2 and picked[1] > picked[0]:
+            start, end = pd.Timestamp(picked[0]), pd.Timestamp(picked[1])
+        else:
+            start = end = None
+            problem = "Pick an end date after the start date to finish the range."
+    else:
+        start, end = windows[period]
+with f4:
+    scale = st.segmented_control(
+        "Scale", ["Linear", "Log"], required=True, key="scale",
+        help="A log scale keeps calm periods readable next to the 2008 and 2020 spikes. It defaults to log "
+        "on the full history and linear elsewhere.",
     )
-    st.dataframe(
-        table,
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "QLIKE": st.column_config.NumberColumn(format="%.3f"),
-            "QLIKE vs EWMA": st.column_config.NumberColumn(format="%+.1f%%"),
-            "MSE (%²)": st.column_config.NumberColumn(format="%.2f"),
-            "MSE vs EWMA": st.column_config.NumberColumn(format="%+.1f%%"),
-        },
+
+if problem is None and not chosen:
+    problem = "Select at least one model to draw the chart and score it."
+fc = pd.DataFrame()
+if problem is None:
+    fc = forecasts[(forecasts["horizon"] == horizon) & forecasts["date"].between(start, end)]
+    if fc.empty:
+        problem = "There are no forecasts in this range. Try a longer one."
+
+if problem is not None:
+    st.info(problem)
+else:
+    wide = fc.pivot(index="date", columns="model", values="forecast")
+    realized = fc.groupby("date")["realized"].first()
+    vol = wide.apply(lambda s: to_annual_vol(s, horizon))
+    vol_realized = to_annual_vol(realized, horizon)
+    in_window = forecasts[forecasts["model"].isin(chosen)]
+    scored = summarize(in_window, baseline=BASELINE, start=start, end=end)
+
+    # Models in the fixed order, realized last so it's drawn on top; label the most accurate model first.
+    lines = [(labels[m], vol[m], series_color(m)) for m in chosen if m in vol.columns]
+    lines += [("Realized", vol_realized, REALIZED_INK.get(st.context.theme.type, REALIZED_FALLBACK))]
+    rank = scored[scored["horizon"] == horizon].sort_values("qlike")["model"].map(labels).tolist()
+    label_order = [*rank, *(n for n, _, _ in lines[:-1] if n not in rank), "Realized"]
+    # Realized is drawn last, so on top, and a little thicker than the forecasts. Daily realized volatility
+    # is very spiky: lines are thinner on the 1-day horizon, and over more than about four years of it a
+    # translucent realized line keeps the forecasts underneath visible.
+    styles = {name: {"width": 1.25 if horizon == 1 else 1.75} for name, _, _ in lines}
+    styles["Realized"] = {"width": 1.5 if horizon == 1 else 2.25, "opacity": 0.45 if horizon == 1 and len(vol) > 1000 else 1.0}
+    st.plotly_chart(
+        race_figure(lines, windows, start, end, label_order, styles, log=scale == "Log"),
+        width="stretch", theme="streamlit", config={"displayModeBar": False, "responsive": True},
     )
     st.caption(
-        "Lower is better. QLIKE is the headline metric: it stays reliable when realized volatility is itself "
-        "estimated with noise, and it penalizes under-forecasting more than over-forecasting. "
-        "All models are scored on the same days."
+        f"Annualized volatility, {'log' if scale == 'Log' else 'linear'} scale. Realized covers the "
+        f"{'following day' if horizon == 1 else f'following {horizon} trading days'}, so it ends "
+        f"{'a day' if horizon == 1 else f'{horizon} trading days'} before the forecasts do."
     )
 
-with st.expander("Data behind the chart"):
-    data = vol.rename(columns=labels).assign(Realized=vol_realized).round(2)
-    st.dataframe(data, width="stretch")
+    # ------------------------------------------------------------------------- accuracy
+
+    st.subheader("Accuracy")
+    if scored.empty:
+        st.info("No scored forecasts in this window yet: realized volatility isn't known until the horizon has passed.")
+    else:
+        scored = scored.merge(bias(in_window, start, end), on=["model", "horizon"], how="left")
+        scored = scored.sort_values(["horizon", "qlike"]).reset_index(drop=True)
+        n_models = scored.groupby("horizon")["model"].transform("size")
+        is_best = (scored["qlike"] == scored.groupby("horizon")["qlike"].transform("min")) & (n_models > 1)
+        is_base = scored["model"] == BASELINE
+        table = pd.DataFrame(
+            {
+                "Horizon": scored["horizon"].map(lambda h: HORIZON_SHORT.get(h, f"{h}-day")),
+                "Model": scored["model"].map(labels),
+                "QLIKE": scored["qlike"],
+                f"QLIKE vs. {base_label}": np.where(is_base, "baseline", scored["qlike_rel"].map(vs_baseline)),
+                "MSE (%²)": scored["mse_pct2"],
+                f"MSE vs. {base_label}": np.where(is_base, "baseline", scored["mse_rel"].map(vs_baseline)),
+                "Bias (×)": scored["bias"],
+                "Days": scored["n"],
+            }
+        )
+        best_rows = set(np.flatnonzero(is_best))
+        styled = table.style.apply(
+            lambda row: [f"background-color: {NEUTRAL_WASH}" if row.name in best_rows else ""] * len(row), axis=1
+        )
+        st.dataframe(
+            styled,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "QLIKE": st.column_config.NumberColumn(format="%.3f", help="Mean QLIKE loss. 0 is perfect; lower is better."),
+                f"QLIKE vs. {base_label}": st.column_config.TextColumn(
+                    help=f"Mean QLIKE loss relative to the {base_label} baseline. Lower is better."
+                ),
+                "MSE (%²)": st.column_config.NumberColumn(
+                    format="%.2f", help="Mean squared error on variance, in percent squared. Lower is better."
+                ),
+                f"MSE vs. {base_label}": st.column_config.TextColumn(
+                    help=f"Mean squared error relative to the {base_label} baseline. Lower is better."
+                ),
+                "Bias (×)": st.column_config.NumberColumn(
+                    format="%.2f",
+                    help="Mean forecast variance divided by mean realized variance on the scored days. 1.00 is "
+                    "unbiased; above 1 means the forecasts ran high on average, below 1 that they ran low.",
+                ),
+                "Days": st.column_config.NumberColumn(format="localized", help="Trading days scored."),
+            },
+        )
+        missing = "" if BASELINE in chosen else f" Add {base_label} to compare each model with the baseline."
+        st.caption(
+            f"Window {fmt_date(scored['start'].min())} to {fmt_date(scored['end'].max())}, scoring only days whose "
+            "outcome is known, the same days for every model. Shaded row: lowest QLIKE at that horizon." + missing
+        )
+        st.caption(
+            "QLIKE penalizes under-forecasting more than over-forecasting, so read accuracy and bias together. "
+            "Bias describes the forecasts; it doesn't explain the accuracy gap."
+        )
+
+    with st.expander("Data behind the chart"):
+        data = vol.rename(columns=labels).assign(Realized=vol_realized).round(2)
+        data = data.rename(columns=lambda c: f"{c} (%)")
+        st.dataframe(
+            data,
+            width="stretch",
+            placeholder="—",
+            column_config={
+                "_index": st.column_config.DateColumn("Forecast date", format="YYYY-MM-DD"),
+                **{c: st.column_config.NumberColumn(format="%.2f") for c in data.columns},
+            },
+        )
+        st.caption("Annualized volatility in percent. Realized stays empty until the horizon has passed.")
 
 # ----------------------------------------------------------------------------- method
 
 with st.expander("How this works"):
-    proxy = meta.get("proxy", {})
     st.markdown(
         f"""
 **Target.** Daily variance is estimated from each day's open, high, low and close (Garman–Klass)
@@ -257,7 +656,14 @@ scrambles all data after a cutoff and checks that no earlier forecast changes.
 **Models.** EWMA (λ = 0.94) is the naive baseline. HAR-RV regresses future variance on the last day,
 week and month of variance. GARCH, a Kalman-filter stochastic volatility model and LightGBM come next.
 
+**Scores.** QLIKE and MSE are the two losses that still rank forecasts correctly when realized variance
+is itself estimated with noise (Patton 2011). Bias is mean forecast over mean realized variance on the
+same days.
+
 **Proxy check.** Squared returns average {proxy.get('ret2_over_v', float('nan')):.2f}x the variance proxy
-in this data{' (outside the expected 0.8–1.25 range: the index sample records stale opens, so absolute levels run low; model comparisons are still like for like)' if not proxy.get('ok', True) else ''}.
+in this data{' (outside the expected 0.8–1.25 range: the index sample records stale opens, so absolute levels run low; model comparisons are still like for like)' if not proxy.get('ok', True) else ', within the expected 0.8–1.25 range'}.
+
+**Not yet.** Significance tests (Diebold–Mariano, Model Confidence Set) arrive with the next models, so
+the gaps in the accuracy table aren't yet tested for statistical significance.
 """
     )

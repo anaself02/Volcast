@@ -112,6 +112,17 @@ The app reads `results/` only. It never fits models or downloads data.
 3. **Risk** (phase 4): VaR/ES bands against returns with breaches marked, backtest table and traffic light.
 4. **Methodology:** target, protocol and metrics in plain language.
 
+**Phase 1 page, top to bottom** (`app/Home.py`). Dense and quiet, like an internal risk dashboard: a neutral interface, colour only for data series and status, tabular figures throughout, units in column headers, ISO dates.
+- **Status strip:** one terminal-style line above everything: data source, data through, last refit, out-of-sample window and days scored per horizon. The source, dates and window come from `meta.json`; the last refit date from `forecasts.parquet` (`refit_date`) and the days scored from `metrics.parquet`, since `meta.json` doesn't carry them.
+- **Header:** the name and one plain sentence on what the page shows. The offline sample shows an info banner and a failed proxy check (`meta.json → proxy.ok` false) shows a warning. Neither is ever hidden.
+- **Headline card:** for each horizon, how much lower the most accurate model's mean QLIKE is than EWMA's over the full out-of-sample period ("18.1%", "lower QLIKE than EWMA"), read from `metrics.parquet`. Directly under the numbers, a neutral caution line says the gap is not yet tested for statistical significance. On the sample the card is labelled "Development sample, not a finding".
+- **Latest forecast card**, the same height as the headline card: the most accurate model's forecast per horizon and VIX, each with its change from the prior day and, for the models, its gap to realized volatility over the matching recent period ("3.3 pts above realized vol over the last 22 days (11.1%)"). An "All models" popover lists every model's latest forecast.
+- **Forecast vs. realized:** one filter row (horizon, models, period, scale) scopes both the chart and the accuracy table. Period defaults to the last 2 years and offers the full history, each named stress period and a custom range. Scale defaults to log on the full history (so calm years aren't squashed by 2008 and 2020) and linear elsewhere, and the toggle overrides it. Realized volatility is drawn last, on top, a little thicker than the forecasts, in neutral ink (dark grey on the light theme, light grey on the dark one). Every stress period in view is shaded and labelled: full names when they all fit, short ones ("GFC", "COVID") when they don't, in up to three staggered rows sized for a 375px phone; a label that still can't fit is left to the tooltip, which names every band. Lines end in direct labels where they don't collide (most accurate model first), next to a legend, a crosshair and a unified tooltip. Zoom is by period only (no drag), so the chart doesn't capture scrolling on phones.
+- **Accuracy:** both horizons for the selected window and models, on summarize()'s common sample. Columns: QLIKE, QLIKE vs. EWMA in words, MSE (%²), MSE vs. EWMA in words, Bias (×) and days scored. Bias is mean forecast over mean realized variance on the same days (1.00 is unbiased), computed in the app from `forecasts.parquet`; it is descriptive only. The best model per horizon is shown by a neutral row tint. A caption says to read accuracy and bias together, since QLIKE penalizes under-forecasting more than over-forecasting.
+- **Data behind the chart** (the plotted values, a dash where realized isn't known yet) and **How this works** (method, scores, proxy check, what isn't tested yet) are expanders.
+- **Empty and loading states:** no models selected, an unfinished custom range, or a window with no scored forecasts show a one-line instruction instead of an empty chart or table. Missing results show how to run the pipeline. The first load shows a spinner.
+- **Chrome:** `toolbarMode = "minimal"` hides Deploy and the developer menu, so the theme follows the viewer's system setting. The only custom CSS is one block at the top of `app/Home.py`, hooked on `data-testid` attributes and the app's own `vc-*` classes.
+
 **Results contract** (written by `volcast.pipeline`)
 
 | File | Contents |
@@ -119,7 +130,7 @@ The app reads `results/` only. It never fits models or downloads data.
 | `forecasts.parquet` | `date` (origin), `model`, `horizon`, `forecast`, `realized` (NaN until observed), `refit_date` |
 | `metrics.parquet` | `model`, `horizon`, `n`, `qlike`, `mse_pct2`, `qlike_rel`, `mse_rel`, `start`, `end` |
 | `panel.parquet` | `date`, `close`, `ret`, `v`, `vix` |
-| `meta.json` | `source`, `source_label`, `data_start`, `data_end`, `oos_start`, `generated_at`, `models` (name → label), `horizons`, `crisis_windows`, `validation` |
+| `meta.json` | `source`, `source_label`, `data_start`, `data_end`, `oos_start`, `refit_every`, `generated_at`, `models` (name → label), `horizons`, `crisis_windows`, `proxy`, `validation` |
 
 ## 9. Engineering
 
@@ -169,7 +180,13 @@ volcast/
 - **Refit every 22 days:** a compromise between realism and runtime (GARCH refits are the slow part).
 - **Range proxy vs return-based GARCH:** GARCH models close-to-close returns while the target is range-based. Check levels with Mincer–Zarnowitz before reading too much into GARCH's QLIKE.
 - **Sample-data quirk:** stale index opens push the proxy 30–50% low in most sample years (§2). Caught by the proxy level check, which is now permanent.
-- **App colours:** Streamlit applies its light/dark theme in the browser and can't reliably tell the app which one is showing on first load, so the chart uses one set of palette steps validated against both backgrounds (`#ffffff` and `#0e1117`), and widgets use a neutral accent (`.streamlit/config.toml`).
+- **App colours:** Streamlit applies its light/dark theme in the browser and can't reliably tell the app which one is showing on first load (`st.context.theme` can be wrong then), so the chart uses one set of palette steps validated against both backgrounds (`#ffffff` and `#0e1117`) and a neutral wash for stress periods. Widgets use one accent, a purple that no chart series uses, stepped per mode (`#7c3eb3` light, `#b893d4` dark, in `.streamlit/config.toml`). It has at least 4.5:1 contrast as text on its background and is at least 15 OKLab ΔE from every series colour (8 under protan/deutan simulation). It replaced a neutral grey accent that made selected controls look dimmer than unselected ones in dark mode and put white tag text on a 2.6:1 background. Models are now pills rather than a multiselect, so no white-on-accent text remains.
+- **Chart labels:** the plot's width is only known in the browser, so stress-period labels are placed for a phone-sized plot and skipped when they would collide; the tooltip names every band. Line labels sit at the right edge and are dropped, not nudged, when two would overlap.
+- **App colours, second pass (supersedes the purple accent above):** the interface went neutral for a sober, information-dense look, with colour reserved for data series and status. The accent is ink, `#31312e` light and `#e4e3dd` dark (13:1 and 14.7:1 on their backgrounds). Selected pills and segments read by their border and tint; the date picker shows its selected day as dark text on the light accent. The best-row tint uses the same neutral wash as the stress bands.
+- **Realized line colour per theme:** Streamlit's theme colours don't reach Plotly traces (checked: an uncoloured trace stays Plotly blue in both modes), so the app picks the realized ink from `st.context.theme.type`: the palette's secondary ink, `#52514e` on light (7.9:1) and `#c3c2b7` on dark (10.6:1), with the old `#7d7c76` (4.2:1 and 4.5:1) when the type is unknown, as in tests. In Streamlit 1.64 the type was right on first load in both modes. A live OS theme switch doesn't rerun the app, so the line keeps the old grey until the next interaction (2.4:1 or 1.8:1 against the other background in the meantime). The palette validator's categorical checks don't apply to a neutral: it passes separation from the series (ΔE ≥ 22) and contrast, and fails the chroma floor by construction. This is the one place where the "validated against both backgrounds" rule above gives way to a theme-specific colour.
+- **Dense daily realized line:** with more than about four years of the 1-day horizon, the daily realized line on top would bury the forecasts, so it becomes translucent there. It is still drawn on top.
+- **Label widths:** stress-period labels are fitted with the chart font's measured glyph advances (Source Sans, `GLYPH_EM` in `app/Home.py`), within a pixel of the rendered width; a flat per-character estimate was wrong by up to 30% in both directions.
+- **Defaults:** the chart opens on the last 2 years (readable, and what a desk would check first); the headline card always reports the full out-of-sample period from `metrics.parquet`, so the default window never changes the headline.
 
 ## 11. Build phases
 
@@ -181,6 +198,8 @@ volcast/
   - [x] QLIKE and MSE evaluation, relative to EWMA
   - [x] Look-ahead check with negative control
   - [x] Single-page Streamlit app and CI
+  - [x] App design pass: headline result, latest forecast, stress-period bands, plain-language accuracy table, light/dark and phone layouts
+  - [x] App design pass 2: status strip, neutral interface, significance caveat under the headline, 2-year default window, log/linear scale, realized line on top, labels on every stress band, Bias column
 - [ ] **Phase 2:** GJR-GARCH-t, LightGBM, Diebold–Mariano, MCS, Mincer–Zarnowitz, regimes
 - [ ] **Phase 3:** Kalman SV, VIX comparison
 - [ ] **Phase 4:** risk layer (VaR/ES, Kupiec, Christoffersen, traffic light; volatility targeting as stretch)
